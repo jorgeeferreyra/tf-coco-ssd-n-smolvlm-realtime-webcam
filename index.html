@@ -4,6 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Camera Interaction App</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+    
     <style>
         body {
             font-family: sans-serif;
@@ -73,13 +76,19 @@
 
     <h1>Camera Interaction App</h1>
 
-    <video id="videoFeed" autoplay playsinline></video>
-    <canvas id="canvas" class="hidden"></canvas> <!-- For capturing frames -->
+    <div style="position: relative; width: 480px; height: 360px; margin: 0 auto;"> <!-- Container for video and canvas -->
+        <video id="videoFeed" autoplay playsinline></video>
+        <canvas id="canvas" class="hidden" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%;"></canvas> <!-- Canvas for detections -->
+    </div>
 
     <div class="io-areas">
         <div>
-            <label for="baseURL">Base API:</label><br>
-            <input id="baseURL" name="Instruction" value="http://localhost:8080"></textarea>
+            <label for="baseURL">Llama.cpp API Base URL (SmolVLM):</label><br>
+            <input id="baseURL" style="width: 40em" name="LlamaCppBaseURL" value="http://localhost:8080"></input>
+        </div>
+        <div>
+            <label for="translationServerURL">Llama.cpp Translation API URL:</label><br>
+            <input id="translationServerURL" style="width: 40em" name="LlamaCppTranslationURL" value="http://localhost:8081"></input>
         </div>
         <div>
             <label for="instructionText">Instruction:</label><br>
@@ -111,12 +120,14 @@
         const responseText = document.getElementById('responseText');
         const intervalSelect = document.getElementById('intervalSelect');
         const startButton = document.getElementById('startButton');
+        const translationServerURL = document.getElementById('translationServerURL');
 
-        instructionText.value = "What do you see?"; // default instruction
+        instructionText.value = "Describe what you see."; // default instruction, changed to English as SmolVLM expects English.
 
         let stream;
         let intervalId;
         let isProcessing = false;
+        let model = null; // For COCO-SSD model
 
         // Returns response text (string)
         async function sendChatCompletionRequest(instruction, imageBase64URL) {
@@ -145,12 +156,66 @@
             return data.choices[0].message.content;
         }
 
+        async function translateToSpanish(textToTranslate) {
+            if (!textToTranslate || typeof textToTranslate !== 'string' || textToTranslate.trim() === "") {
+                return "No text provided for translation.";
+            }
+            // Using a more specific prompt for llama.cpp completion endpoint
+            const prompt = `User: Translate the following English text to Spanish. Provide only the Spanish translation and nothing else. Do not include any introductory phrases like "Here is the translation:". If the input is an error message or not suitable for direct translation, return it as is.\nEnglish text: "${textToTranslate}"\nAssistant:`;
+
+            try {
+                const response = await fetch(`${translationServerURL.value}/completion`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        prompt: prompt,
+                        n_predict: 128, // As per your example
+                        temperature: 0.1, // Low temperature for more deterministic translation
+                        top_k: 40,
+                        top_p: 0.9,
+                        repeat_penalty: 1.1,
+                        stop: ["User:", "Assistant:", "\n"] // Stop sequences to prevent model from generating extra dialog
+                    })
+                });
+                if (!response.ok) {
+                    const errorData = await response.text();
+                    console.error(`Llama.cpp translation server error: ${response.status} - ${errorData}`);
+                    return `Translation server error: ${response.status} - ${errorData}. Original: ${textToTranslate}`;
+                }
+                const data = await response.json();
+                if (data && data.content) {
+                    return data.content.trim();
+                } else {
+                    console.error("Llama.cpp translation error: Unexpected response format or no content", data);
+                    return `Translation error: Unexpected format or no content. Original: ${textToTranslate}`;
+                }
+            } catch (error) {
+                console.error("Error during translation request to Llama.cpp server:", error);
+                return `Translation request failed: ${error.message}. Original: ${textToTranslate}`;
+            }
+        }
+
         // 1. Ask for camera permission on load
         async function initCamera() {
             try {
                 stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
                 video.srcObject = stream;
-                responseText.value = "Camera access granted. Ready to start.";
+                video.onloadedmetadata = () => { // Ensure video metadata is loaded for dimensions
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                };
+                responseText.value = "Camera access granted. Loading COCO-SSD model...";
+                try {
+                    model = await cocoSsd.load();
+                    responseText.value = "Camera and model ready. Click Start.";
+                    console.log("COCO-SSD model loaded.");
+                } catch (err) {
+                    console.error("Error loading COCO-SSD model:", err);
+                    responseText.value = `Error loading model: ${err.message}. Object detection will not work.`;
+                    alert(`Error loading COCO-SSD model: ${err.message}`);
+                }
             } catch (err) {
                 console.error("Error accessing camera:", err);
                 responseText.value = `Error accessing camera: ${err.name} - ${err.message}. Please ensure permissions are granted and you are on HTTPS or localhost.`;
@@ -159,15 +224,68 @@
         }
 
         function captureImage() {
-            if (!stream || !video.videoWidth) {
-                console.warn("Video stream not ready for capture.");
+            if (!stream || !video.videoWidth || video.videoWidth === 0) {
+                console.warn("Video stream not ready for capture or dimensions are zero.");
                 return null;
             }
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
+            // Use a temporary canvas for image capture to avoid interfering with display canvas
+            const tempCanvas = document.createElement('canvas');
+            tempCanvas.width = video.videoWidth;
+            tempCanvas.height = video.videoHeight;
+            const context = tempCanvas.getContext('2d');
+            context.drawImage(video, 0, 0, tempCanvas.width, tempCanvas.height);
+            return tempCanvas.toDataURL('image/jpeg', 0.8);
+        }
+
+        async function renderPredictions() {
+            if (!isProcessing || !model || !video.srcObject || video.paused || video.ended || video.readyState < video.HAVE_METADATA) {
+                if (isProcessing && model && video.srcObject && !video.paused && !video.ended) { // If model is there, keep trying if video is just not ready yet
+                    requestAnimationFrame(renderPredictions);
+                } else if (!isProcessing) {
+                    const context = canvas.getContext('2d');
+                    context.clearRect(0, 0, canvas.width, canvas.height); // Clear canvas when stopping
+                }
+                return;
+            }
+
+            // Ensure canvas dimensions match video dimensions
+            if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+            }
+
             const context = canvas.getContext('2d');
-            context.drawImage(video, 0, 0, canvas.width, canvas.height);
-            return canvas.toDataURL('image/jpeg', 0.8); // Use JPEG for smaller size, 0.8 quality
+            context.clearRect(0, 0, canvas.width, canvas.height); // Clear previous drawings
+            context.drawImage(video, 0, 0, canvas.width, canvas.height); // Draw current video frame
+
+            const predictions = await model.detect(video);
+
+            // Draw bounding boxes and labels
+            predictions.forEach(prediction => {
+                context.beginPath();
+                context.rect(...prediction.bbox);
+                context.lineWidth = 2;
+                context.strokeStyle = 'red';
+                context.stroke();
+
+                context.font = '16px Arial';
+                const text = `${prediction.class} (${Math.round(prediction.score * 100)}%)`;
+                const textWidth = context.measureText(text).width;
+                const textHeight = 16; // Approximate height
+
+                let rectX = prediction.bbox[0];
+                let rectY = prediction.bbox[1] > textHeight + 4 ? prediction.bbox[1] - (textHeight + 4) : prediction.bbox[1] + 2;
+                
+                context.fillStyle = 'red';
+                context.fillRect(rectX, rectY, textWidth + 4, textHeight + 4);
+                
+                context.fillStyle = 'white';
+                context.fillText(text, rectX + 2, rectY + textHeight - 2);
+            });
+
+            if (isProcessing) {
+                requestAnimationFrame(renderPredictions); // Loop
+            }
         }
 
         async function sendData() {
@@ -189,8 +307,16 @@
             };
 
             try {
-                const response = await sendChatCompletionRequest(payload.instruction, payload.imageBase64URL);
-                responseText.value = response;
+                const englishText = await sendChatCompletionRequest(payload.instruction, payload.imageBase64URL);
+                if (typeof englishText === 'string' && englishText.startsWith("Server error:")) {
+                    responseText.value = englishText; // Show SmolVLM error directly
+                } else if (typeof englishText === 'string') {
+                    responseText.value = "Translating to Spanish..."; // Intermediate message
+                    const spanishText = await translateToSpanish(englishText);
+                    responseText.value = spanishText;
+                } else {
+                     responseText.value = "Received unexpected data from SmolVLM.";
+                }
             } catch (error) {
                 console.error('Error sending data:', error);
                 responseText.value = `Error: ${error.message}`;
@@ -203,6 +329,12 @@
                 alert("Camera not available. Please grant permission first.");
                 return;
             }
+            if (!model) {
+                responseText.value = "COCO-SSD Model not loaded yet. Cannot start object detection.";
+                alert("COCO-SSD Model not loaded. Please wait or check console for errors.");
+                return;
+            }
+
             isProcessing = true;
             startButton.textContent = "Stop";
             startButton.classList.remove('start');
@@ -210,20 +342,25 @@
 
             instructionText.disabled = true;
             intervalSelect.disabled = true;
+            baseURL.disabled = true; // Disable Llama.cpp URL input
+            translationServerURL.disabled = true; // Disable Llama.cpp Translation URL input
 
-            responseText.value = "Processing started...";
+            responseText.value = "Object detection started. Processing chat requests...";
+            
+            canvas.classList.remove('hidden'); // Make canvas visible
+            renderPredictions(); // Start the detection loop
 
             const intervalMs = parseInt(intervalSelect.value, 10);
             
-            // Initial immediate call
+            // Initial immediate call for chat completion
             sendData(); 
             
-            // Then set interval
+            // Then set interval for chat completion
             intervalId = setInterval(sendData, intervalMs);
         }
 
         function handleStop() {
-            isProcessing = false;
+            isProcessing = false; // This will stop the renderPredictions loop
             if (intervalId) {
                 clearInterval(intervalId);
                 intervalId = null;
@@ -234,7 +371,16 @@
 
             instructionText.disabled = false;
             intervalSelect.disabled = false;
-            if (responseText.value.startsWith("Processing started...")) {
+            baseURL.disabled = false; // Enable Llama.cpp URL input
+            translationServerURL.disabled = false; // Enable Llama.cpp Translation URL input
+
+            const context = canvas.getContext('2d'); // Ensure canvas is cleared
+            if (canvas.width > 0 && canvas.height > 0) {
+                 context.clearRect(0, 0, canvas.width, canvas.height);
+            }
+            canvas.classList.add('hidden'); // Hide canvas
+
+            if (responseText.value.startsWith("Object detection started...") || responseText.value.startsWith("Processing started...")) {
                 responseText.value = "Processing stopped.";
             }
         }
